@@ -1,6 +1,6 @@
 from datetime import date, datetime, timedelta, timezone
 from textwrap import dedent
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 if TYPE_CHECKING:
     from agno.tracing.schemas import Span, Trace
@@ -1327,24 +1327,31 @@ class SurrealDb(BaseDb):
         )
         return deserialize_eval_run_record(result) if result else None
 
-    def delete_eval_runs(self, eval_run_ids: List[str]) -> None:
+    def delete_eval_runs(self, eval_run_ids: List[str], user_id: Optional[str] = None) -> None:
         """Delete multiple eval runs from the database.
 
         Args:
             eval_run_ids (List[str]): List of eval run IDs to delete.
+            user_id (Optional[str]): If set, only delete runs owned by this user.
         """
         table = self._get_table("evals")
         records = [RecordID(table, id) for id in eval_run_ids]
-        _ = self.client.query(f"DELETE FROM {table} WHERE id IN $records", {"records": records})  # type: ignore[dict-item]
+        query = f"DELETE FROM {table} WHERE id IN $records"
+        bindings: Dict[str, Any] = {"records": records}
+        if user_id is not None:
+            query += " AND user_id = $user_id"
+            bindings["user_id"] = user_id
+        _ = self.client.query(query, bindings)  # type: ignore[dict-item]
 
     def get_eval_run(
-        self, eval_run_id: str, deserialize: Optional[bool] = True
+        self, eval_run_id: str, deserialize: Optional[bool] = True, user_id: Optional[str] = None
     ) -> Optional[Union[EvalRunRecord, Dict[str, Any]]]:
         """Get an eval run from the database.
 
         Args:
             eval_run_id (str): The ID of the eval run to get.
             deserialize (Optional[bool]): Whether to serialize the eval run. Defaults to True.
+            user_id (Optional[str]): If set, only return the run if owned by this user.
 
         Returns:
             Optional[Union[EvalRunRecord, Dict[str, Any]]]:
@@ -1357,6 +1364,8 @@ class SurrealDb(BaseDb):
         table = self._get_table("evals")
         record = RecordID(table, eval_run_id)
         result = self._query_one("SELECT * FROM ONLY $record", {"record": record}, dict)
+        if result is not None and user_id is not None and result.get("user_id") != user_id:
+            return None
         if not result or not deserialize:
             return desurrealize_eval_run_record(result) if result is not None else None
         return deserialize_eval_run_record(result)
@@ -1374,6 +1383,7 @@ class SurrealDb(BaseDb):
         filter_type: Optional[EvalFilterType] = None,
         eval_type: Optional[List[EvalType]] = None,
         deserialize: Optional[bool] = True,
+        user_id: Optional[str] = None,
     ) -> Union[List[EvalRunRecord], Tuple[List[Dict[str, Any]], int]]:
         """Get all eval runs from the database.
 
@@ -1386,6 +1396,7 @@ class SurrealDb(BaseDb):
             team_id (Optional[str]): The ID of the team to filter by.
             workflow_id (Optional[str]): The ID of the workflow to filter by.
             model_id (Optional[str]): The ID of the model to filter by.
+            user_id (Optional[str]): If set, only return runs owned by this user.
             eval_type (Optional[List[EvalType]]): The type of eval to filter by.
             filter_type (Optional[EvalFilterType]): The type of filter to apply.
             deserialize (Optional[bool]): Whether to serialize the eval runs. Defaults to True.
@@ -1401,17 +1412,25 @@ class SurrealDb(BaseDb):
         table = self._get_table("evals")
 
         where = WhereClause()
-        if filter_type is not None:
-            if filter_type == EvalFilterType.AGENT:
-                where.and_("agent", RecordID(self._get_table("agents"), agent_id))
-            elif filter_type == EvalFilterType.TEAM:
-                where.and_("team", RecordID(self._get_table("teams"), team_id))
-            elif filter_type == EvalFilterType.WORKFLOW:
-                where.and_("workflow", RecordID(self._get_table("workflows"), workflow_id))
+        if user_id is not None:
+            where.and_("user_id", user_id)
+        if agent_id is not None:
+            where.and_("agent", RecordID(self._get_table("agents"), agent_id))
+        if team_id is not None:
+            where.and_("team", RecordID(self._get_table("teams"), team_id))
+        if workflow_id is not None:
+            where.and_("workflow", RecordID(self._get_table("workflows"), workflow_id))
         if model_id is not None:
             where.and_("model_id", model_id)
-        if eval_type is not None:
-            where.and_("eval_type", eval_type)
+        if eval_type is not None and len(eval_type) > 0:
+            where.and_("eval_type", [et.value for et in eval_type], "IN")
+        if filter_type is not None:
+            if filter_type == EvalFilterType.AGENT:
+                where.and_("agent", None, "!=")
+            elif filter_type == EvalFilterType.TEAM:
+                where.and_("team", None, "!=")
+            elif filter_type == EvalFilterType.WORKFLOW:
+                where.and_("workflow", None, "!=")
         where_clause, where_vars = where.build()
 
         # Order
@@ -1430,11 +1449,11 @@ class SurrealDb(BaseDb):
         result = self._query(query, where_vars, dict)
 
         if not deserialize:
-            return list(result), total_count
+            return [desurrealize_eval_run_record(x) for x in result], total_count
         return [deserialize_eval_run_record(x) for x in result]
 
     def rename_eval_run(
-        self, eval_run_id: str, name: str, deserialize: Optional[bool] = True
+        self, eval_run_id: str, name: str, deserialize: Optional[bool] = True, user_id: Optional[str] = None
     ) -> Optional[Union[EvalRunRecord, Dict[str, Any]]]:
         """Update the name of an eval run in the database.
 
@@ -1442,6 +1461,7 @@ class SurrealDb(BaseDb):
             eval_run_id (str): The ID of the eval run to update.
             name (str): The new name of the eval run.
             deserialize (Optional[bool]): Whether to serialize the eval run. Defaults to True.
+            user_id (Optional[str]): If set, only rename the run if owned by this user.
 
         Returns:
             Optional[Union[EvalRunRecord, Dict[str, Any]]]:
@@ -1452,7 +1472,15 @@ class SurrealDb(BaseDb):
             Exception: If there is an error updating the eval run.
         """
         table = self._get_table("evals")
-        vars = {"record": RecordID(table, eval_run_id), "name": name}
+        record = RecordID(table, eval_run_id)
+
+        # Only rename if owned by this user.
+        if user_id is not None:
+            existing = self._query_one("SELECT * FROM ONLY $record", {"record": record}, dict)
+            if not existing or existing.get("user_id") != user_id:
+                return None
+
+        vars = {"record": record, "name": name}
 
         # Query
         query = dedent("""
@@ -1461,9 +1489,22 @@ class SurrealDb(BaseDb):
         """)
         raw = self._query_one(query, vars, dict)
 
-        if not raw or not deserialize:
-            return raw
+        if not raw:
+            return None
+        if not deserialize:
+            return desurrealize_eval_run_record(raw)
         return deserialize_eval_run_record(raw)
+
+    def update_eval_run_user_id(self, eval_run_id: str, user_id: str) -> None:
+        """Set the owner (user_id) on an existing eval run.
+
+        Args:
+            eval_run_id (str): The ID of the eval run to update.
+            user_id (str): The owner to set.
+        """
+        table = self._get_table("evals")
+        record = RecordID(table, eval_run_id)
+        _ = self.client.query("UPDATE ONLY $record SET user_id = $user_id", {"record": record, "user_id": user_id})
 
     # --- Traces ---
     def upsert_trace(self, trace: "Trace") -> None:
@@ -1527,23 +1568,26 @@ class SurrealDb(BaseDb):
                     update_fields.append("name = $name")
                     update_vars["name"] = trace.name
 
-                # Update context fields only if new value is not None
-                if trace.run_id is not None:
+                # Preserve existing non-null context values: only fill in fields
+                # that the existing row left blank. Otherwise a later upsert from
+                # a child span (e.g. a post-hook agent's run with a different
+                # session_id) would overwrite the trace's already-correct context.
+                if existing.get("run_id") is None and trace.run_id is not None:
                     update_fields.append("run_id = $run_id")
                     update_vars["run_id"] = trace.run_id
-                if trace.session_id is not None:
+                if existing.get("session_id") is None and trace.session_id is not None:
                     update_fields.append("session_id = $session_id")
                     update_vars["session_id"] = trace.session_id
-                if trace.user_id is not None:
+                if existing.get("user_id") is None and trace.user_id is not None:
                     update_fields.append("user_id = $user_id")
                     update_vars["user_id"] = trace.user_id
-                if trace.agent_id is not None:
+                if existing.get("agent_id") is None and trace.agent_id is not None:
                     update_fields.append("agent_id = $agent_id")
                     update_vars["agent_id"] = trace.agent_id
-                if trace.team_id is not None:
+                if existing.get("team_id") is None and trace.team_id is not None:
                     update_fields.append("team_id = $team_id")
                     update_vars["team_id"] = trace.team_id
-                if trace.workflow_id is not None:
+                if existing.get("workflow_id") is None and trace.workflow_id is not None:
                     update_fields.append("workflow_id = $workflow_id")
                     update_vars["workflow_id"] = trace.workflow_id
 
@@ -1734,6 +1778,7 @@ class SurrealDb(BaseDb):
         end_time: Optional[datetime] = None,
         limit: Optional[int] = 20,
         page: Optional[int] = 1,
+        group_by: Literal["session", "agent", "team", "workflow", "endpoint"] = "session",
     ) -> tuple[List[Dict[str, Any]], int]:
         """Get trace statistics grouped by session.
 
@@ -1746,12 +1791,19 @@ class SurrealDb(BaseDb):
             end_time: Filter sessions with traces created before this datetime.
             limit: Maximum number of sessions to return per page.
             page: Page number (1-indexed).
+            group_by: Only the default "session" grouping is supported by this backend.
 
         Returns:
             tuple[List[Dict], int]: Tuple of (list of session stats dicts, total count).
                 Each dict contains: session_id, user_id, agent_id, team_id, workflow_id, total_traces,
                 first_trace_at, last_trace_at.
         """
+        if group_by != "session":
+            raise NotImplementedError(
+                f"get_trace_stats with group_by={group_by!r} is not supported by {self.__class__.__name__}. "
+                "Only the default 'session' grouping is available."
+            )
+
         try:
             table = self._get_table("traces", create_table_if_not_found=False)
 

@@ -42,7 +42,9 @@ from agno.utils.string import generate_id_from_name
 # ---------------------------------------------------------------------------
 
 
-def get_run_output(agent: Agent, run_id: str, session_id: Optional[str] = None) -> Optional[RunOutput]:
+def get_run_output(
+    agent: Agent, run_id: str, session_id: Optional[str] = None, user_id: Optional[str] = None
+) -> Optional[RunOutput]:
     """
     Get a RunOutput from the database.
 
@@ -50,6 +52,7 @@ def get_run_output(agent: Agent, run_id: str, session_id: Optional[str] = None) 
         agent: The Agent instance.
         run_id (str): The run_id to load from storage.
         session_id (Optional[str]): The session_id to load from storage.
+        user_id (Optional[str]): The user_id to scope the session lookup.
     Returns:
         Optional[RunOutput]: The RunOutput from the database or None if not found.
     """
@@ -57,10 +60,12 @@ def get_run_output(agent: Agent, run_id: str, session_id: Optional[str] = None) 
         raise Exception("No session_id provided")
 
     session_id_to_load = session_id or agent.session_id
-    return cast(RunOutput, get_run_output_util(agent, run_id=run_id, session_id=session_id_to_load))
+    return cast(RunOutput, get_run_output_util(agent, run_id=run_id, session_id=session_id_to_load, user_id=user_id))
 
 
-async def aget_run_output(agent: Agent, run_id: str, session_id: Optional[str] = None) -> Optional[RunOutput]:
+async def aget_run_output(
+    agent: Agent, run_id: str, session_id: Optional[str] = None, user_id: Optional[str] = None
+) -> Optional[RunOutput]:
     """
     Get a RunOutput from the database.
 
@@ -68,6 +73,7 @@ async def aget_run_output(agent: Agent, run_id: str, session_id: Optional[str] =
         agent: The Agent instance.
         run_id (str): The run_id to load from storage.
         session_id (Optional[str]): The session_id to load from storage.
+        user_id (Optional[str]): The user_id to scope the session lookup.
     Returns:
         Optional[RunOutput]: The RunOutput from the database or None if not found.
     """
@@ -75,7 +81,9 @@ async def aget_run_output(agent: Agent, run_id: str, session_id: Optional[str] =
         raise Exception("No session_id provided")
 
     session_id_to_load = session_id or agent.session_id
-    return cast(RunOutput, await aget_run_output_util(agent, run_id=run_id, session_id=session_id_to_load))
+    return cast(
+        RunOutput, await aget_run_output_util(agent, run_id=run_id, session_id=session_id_to_load, user_id=user_id)
+    )
 
 
 def get_last_run_output(agent: Agent, session_id: Optional[str] = None) -> Optional[RunOutput]:
@@ -484,8 +492,8 @@ def to_dict(agent: Agent) -> Dict[str, Any]:
     # config["memory_manager"] = agent.memory_manager.to_dict()
     if agent.enable_agentic_memory:
         config["enable_agentic_memory"] = agent.enable_agentic_memory
-    if agent.enable_user_memories:
-        config["enable_user_memories"] = agent.enable_user_memories
+    if agent.update_memory_on_run:
+        config["update_memory_on_run"] = agent.update_memory_on_run
     if agent.add_memories_to_context is not None:
         config["add_memories_to_context"] = agent.add_memories_to_context
 
@@ -517,9 +525,14 @@ def to_dict(agent: Agent) -> Dict[str, Any]:
         config["max_tool_calls_from_history"] = agent.max_tool_calls_from_history
 
     # --- Knowledge settings ---
-    # TODO: implement knowledge serialization
-    # if agent.knowledge is not None:
-    # config["knowledge"] = agent.knowledge.to_dict()
+    # Knowledge is a non-serializable object (it holds live db/vector_db connections),
+    # so we store a reference by name and resolve it from the registry on load.
+    if agent.knowledge is not None:
+        knowledge_name = getattr(agent.knowledge, "name", None)
+        if knowledge_name is not None:
+            config["knowledge"] = {"name": knowledge_name}
+        else:
+            log_warning("Agent knowledge has no name; it cannot be referenced from the registry and will not be saved.")
     if agent.knowledge_filters is not None:
         config["knowledge_filters"] = agent.knowledge_filters
     if agent.enable_agentic_knowledge_filters:
@@ -741,17 +754,13 @@ def from_dict(cls: Type[Agent], data: Dict[str, Any], registry: Optional[Registr
     Returns:
         Agent: Reconstructed agent instance
     """
-    from agno.models.utils import get_model
+    from agno.models.utils import resolve_model
 
     config = data.copy()
 
     # --- Handle Model reconstruction ---
     if "model" in config:
-        model_data = config["model"]
-        if isinstance(model_data, dict) and "id" in model_data:
-            config["model"] = get_model(f"{model_data['provider']}:{model_data['id']}")
-        elif isinstance(model_data, str):
-            config["model"] = get_model(model_data)
+        config["model"] = resolve_model(config["model"], registry)
 
     # --- Handle reasoning_model reconstruction ---
     # TODO: implement reasoning model deserialization
@@ -832,10 +841,16 @@ def from_dict(cls: Type[Agent], data: Dict[str, Any], registry: Optional[Registr
     #     config["culture_manager"] = CultureManager.from_dict(config["culture_manager"])
 
     # --- Handle Knowledge reconstruction ---
-    # TODO: implement knowledge deserialization
-    # if "knowledge" in config and isinstance(config["knowledge"], dict):
-    #     from agno.knowledge import Knowledge
-    #     config["knowledge"] = Knowledge.from_dict(config["knowledge"])
+    # Knowledge is stored as a reference by name and resolved from the registry,
+    # since it holds live db/vector_db connections that cannot be serialized.
+    if "knowledge" in config and isinstance(config["knowledge"], dict):
+        knowledge_name = config["knowledge"].get("name")
+        resolved_knowledge = registry.get_knowledge(knowledge_name) if (registry and knowledge_name) else None
+        if resolved_knowledge is not None:
+            config["knowledge"] = resolved_knowledge
+        else:
+            log_warning(f"Knowledge '{knowledge_name}' not found in registry, skipping.")
+            del config["knowledge"]
 
     # --- Handle CompressionManager reconstruction ---
     # TODO: implement compression manager deserialization
@@ -853,6 +868,22 @@ def from_dict(cls: Type[Agent], data: Dict[str, Any], registry: Optional[Registr
     config.pop("team_id", None)
     config.pop("workflow_id", None)
 
+    if "search_session_history" in config:
+        log_debug("'search_session_history' has been deprecated. Use 'search_past_sessions' instead.")
+        config.pop("search_session_history", None)
+
+    if "num_history_sessions" in config:
+        log_debug("'num_history_sessions' has been deprecated. Use 'num_past_sessions_to_search' instead.")
+        config.pop("num_history_sessions", None)
+
+    if "enable_user_memories" in config:
+        log_debug("'enable_user_memories' has been deprecated. Use 'update_memory_on_run' instead.")
+        config.pop("enable_user_memories", None)
+
+    if "num_past_session_runs" in config:
+        log_debug("'num_past_session_runs' has been deprecated. Use 'num_past_session_runs_in_search' instead.")
+        config.pop("num_past_session_runs", None)
+
     return cls(
         # --- Agent settings ---
         model=config.get("model"),
@@ -867,11 +898,9 @@ def from_dict(cls: Type[Agent], data: Dict[str, Any], registry: Optional[Registr
         enable_agentic_state=config.get("enable_agentic_state", False),
         overwrite_db_session_state=config.get("overwrite_db_session_state", False),
         cache_session=config.get("cache_session", False),
-        search_past_sessions=config.get("search_past_sessions", config.get("search_session_history", False)),
-        num_past_sessions_to_search=config.get("num_past_sessions_to_search", config.get("num_history_sessions")),
-        num_past_session_runs_in_search=config.get(
-            "num_past_session_runs_in_search", config.get("num_past_session_runs")
-        ),
+        search_past_sessions=config.get("search_past_sessions", False),
+        num_past_sessions_to_search=config.get("num_past_sessions_to_search"),
+        num_past_session_runs_in_search=config.get("num_past_session_runs_in_search"),
         enable_session_summaries=config.get("enable_session_summaries", False),
         add_session_summary_to_context=config.get("add_session_summary_to_context"),
         # session_summary_manager=config.get("session_summary_manager"),  # TODO
@@ -881,7 +910,7 @@ def from_dict(cls: Type[Agent], data: Dict[str, Any], registry: Optional[Registr
         # --- Agentic Memory settings ---
         # memory_manager=config.get("memory_manager"),  # TODO
         enable_agentic_memory=config.get("enable_agentic_memory", False),
-        enable_user_memories=config.get("enable_user_memories", False),
+        update_memory_on_run=config.get("update_memory_on_run", False),
         add_memories_to_context=config.get("add_memories_to_context"),
         # --- Learning settings ---
         learning=config.get("learning"),
@@ -894,7 +923,7 @@ def from_dict(cls: Type[Agent], data: Dict[str, Any], registry: Optional[Registr
         num_history_messages=config.get("num_history_messages"),
         max_tool_calls_from_history=config.get("max_tool_calls_from_history"),
         # --- Knowledge settings ---
-        # knowledge=config.get("knowledge"),  # TODO
+        knowledge=config.get("knowledge"),
         knowledge_filters=config.get("knowledge_filters"),
         enable_agentic_knowledge_filters=config.get("enable_agentic_knowledge_filters", False),
         add_knowledge_to_context=config.get("add_knowledge_to_context", False),

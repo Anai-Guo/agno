@@ -2,7 +2,7 @@ import json
 import time
 from datetime import date, datetime, timedelta, timezone
 from os import getenv
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from agno.tracing.schemas import Span, Trace
@@ -17,7 +17,6 @@ from agno.db.dynamo.utils import (
     calculate_date_metrics,
     create_table_if_not_exists,
     deserialize_cultural_knowledge_from_db,
-    deserialize_eval_record,
     deserialize_from_dynamodb_item,
     deserialize_knowledge_row,
     deserialize_session_result,
@@ -770,11 +769,11 @@ class DynamoDb(BaseDb):
             log_error(f"Failed to delete user memories: {str(e)}")
             raise e
 
-    def get_all_memory_topics(self) -> List[str]:
+    def get_all_memory_topics(self, user_id: Optional[str] = None) -> List[str]:
         """Get all memory topics from the database.
 
         Args:
-            user_id: The ID of the user (optional, for filtering).
+            user_id (Optional[str]): The ID of the user to filter by.
 
         Returns:
             List[str]: List of unique memory topics.
@@ -784,8 +783,10 @@ class DynamoDb(BaseDb):
             if table_name is None:
                 return []
 
-            # Build filter expression for user_id if provided
-            scan_kwargs = {"TableName": table_name}
+            scan_kwargs: Dict[str, Any] = {"TableName": table_name}
+            if user_id is not None:
+                scan_kwargs["FilterExpression"] = "user_id = :user_id"
+                scan_kwargs["ExpressionAttributeValues"] = {":user_id": {"S": user_id}}
 
             # Scan the table to get memories
             response = self.client.scan(**scan_kwargs)
@@ -798,11 +799,12 @@ class DynamoDb(BaseDb):
                 items.extend(response.get("Items", []))
 
             # Extract topics from all memories
-            all_topics = set()
+            all_topics: set[str] = set()
             for item in items:
                 memory_data = deserialize_from_dynamodb_item(item)
-                topics = memory_data.get("memory", {}).get("topics", [])
-                all_topics.update(topics)
+                topics = memory_data.get("topics") or []
+                if isinstance(topics, list):
+                    all_topics.update(topics)
 
             return list(all_topics)
 
@@ -1851,11 +1853,21 @@ class DynamoDb(BaseDb):
             log_error(f"Failed to create eval run: {str(e)}")
             raise e
 
-    def delete_eval_runs(self, eval_run_ids: List[str]) -> None:
+    def delete_eval_runs(self, eval_run_ids: List[str], user_id: Optional[str] = None) -> None:
         if not eval_run_ids or not self.eval_table_name:
             return
 
         try:
+            if user_id is not None:
+                # Only delete runs owned by this user.
+                owned = []
+                for eval_run_id in eval_run_ids:
+                    response = self.client.get_item(TableName=self.eval_table_name, Key={"run_id": {"S": eval_run_id}})
+                    item = response.get("Item")
+                    if item is not None and item.get("user_id", {}).get("S") == user_id:
+                        owned.append(eval_run_id)
+                eval_run_ids = owned
+
             for i in range(0, len(eval_run_ids), DYNAMO_BATCH_SIZE_LIMIT):
                 batch = eval_run_ids[i : i + DYNAMO_BATCH_SIZE_LIMIT]
 
@@ -1863,7 +1875,8 @@ class DynamoDb(BaseDb):
                 for eval_run_id in batch:
                     delete_requests.append({"DeleteRequest": {"Key": {"run_id": {"S": eval_run_id}}}})
 
-                self.client.batch_write_item(RequestItems={self.eval_table_name: delete_requests})
+                if delete_requests:
+                    self.client.batch_write_item(RequestItems={self.eval_table_name: delete_requests})
 
         except Exception as e:
             log_error(f"Failed to delete eval runs: {str(e)}")
@@ -1885,7 +1898,13 @@ class DynamoDb(BaseDb):
             log_error(f"Failed to get eval run {eval_run_id}: {str(e)}")
             raise e
 
-    def get_eval_run(self, eval_run_id: str, table: Optional[Any] = None) -> Optional[EvalRunRecord]:
+    def get_eval_run(
+        self,
+        eval_run_id: str,
+        deserialize: Optional[bool] = True,
+        user_id: Optional[str] = None,
+        table: Optional[Any] = None,
+    ) -> Optional[Union[EvalRunRecord, Dict[str, Any]]]:
         if not self.eval_table_name:
             return None
 
@@ -1893,9 +1912,17 @@ class DynamoDb(BaseDb):
             response = self.client.get_item(TableName=self.eval_table_name, Key={"run_id": {"S": eval_run_id}})
 
             item = response.get("Item")
-            if item:
-                return deserialize_eval_record(item)
-            return None
+            if not item:
+                return None
+
+            eval_item = deserialize_from_dynamodb_item(item)
+            if user_id is not None and eval_item.get("user_id") != user_id:
+                return None
+
+            if not deserialize:
+                return eval_item
+
+            return EvalRunRecord.model_validate(eval_item)
 
         except Exception as e:
             log_error(f"Failed to get eval run {eval_run_id}: {str(e)}")
@@ -1914,6 +1941,7 @@ class DynamoDb(BaseDb):
         filter_type: Optional[EvalFilterType] = None,
         eval_type: Optional[List[EvalType]] = None,
         deserialize: Optional[bool] = True,
+        user_id: Optional[str] = None,
     ) -> Union[List[EvalRunRecord], Tuple[List[Dict[str, Any]], int]]:
         try:
             table_name = self._get_table("evals")
@@ -1940,6 +1968,10 @@ class DynamoDb(BaseDb):
             if model_id:
                 filter_expressions.append("model_id = :model_id")
                 expression_values[":model_id"] = {"S": model_id}
+
+            if user_id is not None:
+                filter_expressions.append("user_id = :user_id")
+                expression_values[":user_id"] = {"S": user_id}
 
             if eval_type is not None and len(eval_type) > 0:
                 eval_type_conditions = []
@@ -2003,13 +2035,13 @@ class DynamoDb(BaseDb):
             raise e
 
     def rename_eval_run(
-        self, eval_run_id: str, name: str, deserialize: Optional[bool] = True
+        self, eval_run_id: str, name: str, deserialize: Optional[bool] = True, user_id: Optional[str] = None
     ) -> Optional[Union[EvalRunRecord, Dict[str, Any]]]:
         if not self.eval_table_name:
             return None
 
         try:
-            response = self.client.update_item(
+            update_kwargs: Dict[str, Any] = dict(
                 TableName=self.eval_table_name,
                 Key={"run_id": {"S": eval_run_id}},
                 UpdateExpression="SET #name = :name, updated_at = :updated_at",
@@ -2020,6 +2052,15 @@ class DynamoDb(BaseDb):
                 },
                 ReturnValues="ALL_NEW",
             )
+            # Only rename if owned by this user (also fails when the run is absent).
+            if user_id is not None:
+                update_kwargs["ConditionExpression"] = "user_id = :user_id"
+                update_kwargs["ExpressionAttributeValues"][":user_id"] = {"S": user_id}
+
+            try:
+                response = self.client.update_item(**update_kwargs)
+            except self.client.exceptions.ConditionalCheckFailedException:
+                return None
 
             item = response.get("Attributes")
             if item is None:
@@ -2032,6 +2073,33 @@ class DynamoDb(BaseDb):
 
         except Exception as e:
             log_error(f"Failed to rename eval run {eval_run_id}: {str(e)}")
+            raise e
+
+    def update_eval_run_user_id(self, eval_run_id: str, user_id: str) -> None:
+        """Set the owner (user_id) on an existing eval run.
+
+        Args:
+            eval_run_id (str): The ID of the eval run to update.
+            user_id (str): The owner to set.
+        """
+        if not self.eval_table_name:
+            return
+
+        try:
+            self.client.update_item(
+                TableName=self.eval_table_name,
+                Key={"run_id": {"S": eval_run_id}},
+                UpdateExpression="SET user_id = :user_id",
+                # Avoid upserting a phantom item when the run doesn't exist.
+                ConditionExpression="attribute_exists(run_id)",
+                ExpressionAttributeValues={":user_id": {"S": user_id}},
+            )
+
+        except self.client.exceptions.ConditionalCheckFailedException:
+            return
+
+        except Exception as e:
+            log_error(f"Failed to set owner on eval run {eval_run_id}: {str(e)}")
             raise e
 
     # -- Culture methods --
@@ -2261,22 +2329,26 @@ class DynamoDb(BaseDb):
                     expression_attr_names["#name"] = "name"
                     expression_attr_values[":name"] = {"S": trace.name}
 
-                if trace.run_id is not None:
+                # Preserve existing non-null context values: only fill in fields
+                # that the existing row left blank. Otherwise a later upsert from
+                # a child span (e.g. a post-hook agent's run with a different
+                # session_id) would overwrite the trace's already-correct context.
+                if existing.get("run_id") is None and trace.run_id is not None:
                     update_parts.append("run_id = :run_id")
                     expression_attr_values[":run_id"] = {"S": trace.run_id}
-                if trace.session_id is not None:
+                if existing.get("session_id") is None and trace.session_id is not None:
                     update_parts.append("session_id = :session_id")
                     expression_attr_values[":session_id"] = {"S": trace.session_id}
-                if trace.user_id is not None:
+                if existing.get("user_id") is None and trace.user_id is not None:
                     update_parts.append("user_id = :user_id")
                     expression_attr_values[":user_id"] = {"S": trace.user_id}
-                if trace.agent_id is not None:
+                if existing.get("agent_id") is None and trace.agent_id is not None:
                     update_parts.append("agent_id = :agent_id")
                     expression_attr_values[":agent_id"] = {"S": trace.agent_id}
-                if trace.team_id is not None:
+                if existing.get("team_id") is None and trace.team_id is not None:
                     update_parts.append("team_id = :team_id")
                     expression_attr_values[":team_id"] = {"S": trace.team_id}
-                if trace.workflow_id is not None:
+                if existing.get("workflow_id") is None and trace.workflow_id is not None:
                     update_parts.append("workflow_id = :workflow_id")
                     expression_attr_values[":workflow_id"] = {"S": trace.workflow_id}
 
@@ -2541,6 +2613,7 @@ class DynamoDb(BaseDb):
         end_time: Optional[datetime] = None,
         limit: Optional[int] = 20,
         page: Optional[int] = 1,
+        group_by: Literal["session", "agent", "team", "workflow", "endpoint"] = "session",
     ) -> tuple[List[Dict[str, Any]], int]:
         """Get trace statistics grouped by session.
 
@@ -2553,12 +2626,19 @@ class DynamoDb(BaseDb):
             end_time: Filter sessions with traces created before this datetime.
             limit: Maximum number of sessions to return per page.
             page: Page number (1-indexed).
+            group_by: Only the default "session" grouping is supported by this backend.
 
         Returns:
             tuple[List[Dict], int]: Tuple of (list of session stats dicts, total count).
                 Each dict contains: session_id, user_id, agent_id, team_id, workflow_id, total_traces,
                 first_trace_at, last_trace_at.
         """
+        if group_by != "session":
+            raise NotImplementedError(
+                f"get_trace_stats with group_by={group_by!r} is not supported by {self.__class__.__name__}. "
+                "Only the default 'session' grouping is available."
+            )
+
         try:
             table_name = self._get_table("traces")
             if table_name is None:

@@ -1,6 +1,6 @@
 import time
 from datetime import date, datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 from uuid import uuid4
 
 if TYPE_CHECKING:
@@ -1173,6 +1173,8 @@ class MySQLDb(BaseDb):
             with self.Session() as sess, sess.begin():
                 # MySQL approach: extract JSON array elements differently
                 stmt = select(table.c.topics)
+                if user_id is not None:
+                    stmt = stmt.where(table.c.user_id == user_id)
                 result = sess.execute(stmt).fetchall()
 
                 topics_set = set()
@@ -2003,11 +2005,12 @@ class MySQLDb(BaseDb):
         except Exception as e:
             log_error(f"Error deleting eval run {eval_run_id}: {str(e)}")
 
-    def delete_eval_runs(self, eval_run_ids: List[str]) -> None:
+    def delete_eval_runs(self, eval_run_ids: List[str], user_id: Optional[str] = None) -> None:
         """Delete multiple eval runs from the database.
 
         Args:
             eval_run_ids (List[str]): List of eval run IDs to delete.
+            user_id (Optional[str]): If set, only delete runs owned by this user.
         """
         try:
             table = self._get_table(table_type="evals")
@@ -2016,6 +2019,8 @@ class MySQLDb(BaseDb):
 
             with self.Session() as sess, sess.begin():
                 stmt = table.delete().where(table.c.run_id.in_(eval_run_ids))
+                if user_id is not None:
+                    stmt = stmt.where(table.c.user_id == user_id)
                 result = sess.execute(stmt)
                 if result.rowcount == 0:
                     log_error(f"No eval runs found with IDs: {eval_run_ids}")
@@ -2026,13 +2031,14 @@ class MySQLDb(BaseDb):
             log_error(f"Error deleting eval runs {eval_run_ids}: {str(e)}")
 
     def get_eval_run(
-        self, eval_run_id: str, deserialize: Optional[bool] = True
+        self, eval_run_id: str, deserialize: Optional[bool] = True, user_id: Optional[str] = None
     ) -> Optional[Union[EvalRunRecord, Dict[str, Any]]]:
         """Get an eval run from the database.
 
         Args:
             eval_run_id (str): The ID of the eval run to get.
             deserialize (Optional[bool]): Whether to serialize the eval run. Defaults to True.
+            user_id (Optional[str]): If set, only return the run if owned by this user.
 
         Returns:
             Optional[Union[EvalRunRecord, Dict[str, Any]]]:
@@ -2049,6 +2055,8 @@ class MySQLDb(BaseDb):
 
             with self.Session() as sess, sess.begin():
                 stmt = select(table).where(table.c.run_id == eval_run_id)
+                if user_id is not None:
+                    stmt = stmt.where(table.c.user_id == user_id)
                 result = sess.execute(stmt).fetchone()
                 if result is None:
                     return None
@@ -2076,6 +2084,7 @@ class MySQLDb(BaseDb):
         filter_type: Optional[EvalFilterType] = None,
         eval_type: Optional[List[EvalType]] = None,
         deserialize: Optional[bool] = True,
+        user_id: Optional[str] = None,
     ) -> Union[List[EvalRunRecord], Tuple[List[Dict[str, Any]], int]]:
         """Get all eval runs from the database.
 
@@ -2088,6 +2097,7 @@ class MySQLDb(BaseDb):
             team_id (Optional[str]): The ID of the team to filter by.
             workflow_id (Optional[str]): The ID of the workflow to filter by.
             model_id (Optional[str]): The ID of the model to filter by.
+            user_id (Optional[str]): If set, only return runs owned by this user.
             eval_type (Optional[List[EvalType]]): The type(s) of eval to filter by.
             filter_type (Optional[EvalFilterType]): Filter by component type (agent, team, workflow).
             deserialize (Optional[bool]): Whether to serialize the eval runs. Defaults to True.
@@ -2118,6 +2128,8 @@ class MySQLDb(BaseDb):
                     stmt = stmt.where(table.c.workflow_id == workflow_id)
                 if model_id is not None:
                     stmt = stmt.where(table.c.model_id == model_id)
+                if user_id is not None:
+                    stmt = stmt.where(table.c.user_id == user_id)
                 if eval_type is not None and len(eval_type) > 0:
                     stmt = stmt.where(table.c.eval_type.in_(eval_type))
                 if filter_type is not None:
@@ -2159,13 +2171,14 @@ class MySQLDb(BaseDb):
             raise e
 
     def rename_eval_run(
-        self, eval_run_id: str, name: str, deserialize: Optional[bool] = True
+        self, eval_run_id: str, name: str, deserialize: Optional[bool] = True, user_id: Optional[str] = None
     ) -> Optional[Union[EvalRunRecord, Dict[str, Any]]]:
         """Upsert the name of an eval run in the database, returning raw dictionary.
 
         Args:
             eval_run_id (str): The ID of the eval run to update.
             name (str): The new name of the eval run.
+            user_id (Optional[str]): If set, only rename the run if owned by this user.
 
         Returns:
             Optional[Dict[str, Any]]: The updated eval run, or None if the operation fails.
@@ -2182,9 +2195,11 @@ class MySQLDb(BaseDb):
                 stmt = (
                     table.update().where(table.c.run_id == eval_run_id).values(name=name, updated_at=int(time.time()))
                 )
+                if user_id is not None:
+                    stmt = stmt.where(table.c.user_id == user_id)
                 sess.execute(stmt)
 
-            eval_run_raw = self.get_eval_run(eval_run_id=eval_run_id, deserialize=deserialize)
+            eval_run_raw = self.get_eval_run(eval_run_id=eval_run_id, deserialize=deserialize, user_id=user_id)
             if not eval_run_raw or not deserialize:
                 return eval_run_raw
 
@@ -2193,6 +2208,26 @@ class MySQLDb(BaseDb):
         except Exception as e:
             log_error(f"Error upserting eval run name {eval_run_id}: {str(e)}")
             return None
+
+    def update_eval_run_user_id(self, eval_run_id: str, user_id: str) -> None:
+        """Set the owner (user_id) on an existing eval run.
+
+        Args:
+            eval_run_id (str): The ID of the eval run to update.
+            user_id (str): The owner to set.
+        """
+        try:
+            table = self._get_table(table_type="evals")
+            if table is None:
+                return
+
+            with self.Session() as sess, sess.begin():
+                stmt = table.update().where(table.c.run_id == eval_run_id).values(user_id=user_id)
+                sess.execute(stmt)
+
+        except Exception as e:
+            log_error(f"Error setting owner on eval run {eval_run_id}: {str(e)}")
+            raise e
 
     # -- Culture methods --
 
@@ -2593,13 +2628,17 @@ class MySQLDb(BaseDb):
                         (new_level > existing_level, insert_stmt.inserted.name),
                         else_=table.c.name,
                     ),
-                    # Preserve existing non-null context values using COALESCE
-                    run_id=func.coalesce(insert_stmt.inserted.run_id, table.c.run_id),
-                    session_id=func.coalesce(insert_stmt.inserted.session_id, table.c.session_id),
-                    user_id=func.coalesce(insert_stmt.inserted.user_id, table.c.user_id),
-                    agent_id=func.coalesce(insert_stmt.inserted.agent_id, table.c.agent_id),
-                    team_id=func.coalesce(insert_stmt.inserted.team_id, table.c.team_id),
-                    workflow_id=func.coalesce(insert_stmt.inserted.workflow_id, table.c.workflow_id),
+                    # Preserve existing non-null context values: COALESCE returns
+                    # the first non-null arg, so put the existing column first.
+                    # Otherwise a later upsert from a child span (e.g. a post-hook
+                    # agent's run with a different session_id) would overwrite
+                    # the trace's already-correct context.
+                    run_id=func.coalesce(table.c.run_id, insert_stmt.inserted.run_id),
+                    session_id=func.coalesce(table.c.session_id, insert_stmt.inserted.session_id),
+                    user_id=func.coalesce(table.c.user_id, insert_stmt.inserted.user_id),
+                    agent_id=func.coalesce(table.c.agent_id, insert_stmt.inserted.agent_id),
+                    team_id=func.coalesce(table.c.team_id, insert_stmt.inserted.team_id),
+                    workflow_id=func.coalesce(table.c.workflow_id, insert_stmt.inserted.workflow_id),
                 )
                 sess.execute(upsert_stmt)
 
@@ -2759,6 +2798,7 @@ class MySQLDb(BaseDb):
         end_time: Optional[datetime] = None,
         limit: Optional[int] = 20,
         page: Optional[int] = 1,
+        group_by: Literal["session", "agent", "team", "workflow", "endpoint"] = "session",
     ) -> tuple[List[Dict[str, Any]], int]:
         """Get trace statistics grouped by session.
 
@@ -2771,12 +2811,19 @@ class MySQLDb(BaseDb):
             end_time: Filter sessions with traces created before this datetime.
             limit: Maximum number of sessions to return per page.
             page: Page number (1-indexed).
+            group_by: Only the default "session" grouping is supported by this backend.
 
         Returns:
             tuple[List[Dict], int]: Tuple of (list of session stats dicts, total count).
                 Each dict contains: session_id, user_id, agent_id, team_id, total_traces,
                 workflow_id, first_trace_at, last_trace_at.
         """
+        if group_by != "session":
+            raise NotImplementedError(
+                f"get_trace_stats with group_by={group_by!r} is not supported by {self.__class__.__name__}. "
+                "Only the default 'session' grouping is available."
+            )
+
         try:
             table = self._get_table(table_type="traces")
             if table is None:

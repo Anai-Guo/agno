@@ -87,9 +87,6 @@ def __init__(
     search_past_sessions: Optional[bool] = False,
     num_past_sessions_to_search: Optional[int] = None,
     num_past_session_runs_in_search: Optional[int] = None,
-    # Deprecated params — kept for backward compatibility
-    search_session_history: Optional[bool] = None,
-    num_history_sessions: Optional[int] = None,
     description: Optional[str] = None,
     instructions: Optional[Union[str, List[str], Callable]] = None,
     use_instruction_tags: bool = False,
@@ -144,9 +141,9 @@ def __init__(
     use_json_mode: bool = False,
     parse_response: bool = True,
     db: Optional[Union[BaseDb, AsyncBaseDb]] = None,
+    checkpoint: Optional[Literal["runs", "tool-batch", "tools"]] = None,
     enable_agentic_memory: bool = False,
     update_memory_on_run: bool = False,
-    enable_user_memories: Optional[bool] = None,  # Soon to be deprecated. Use update_memory_on_run
     add_memories_to_context: Optional[bool] = None,
     memory_manager: Optional[MemoryManager] = None,
     enable_session_summaries: bool = False,
@@ -252,12 +249,6 @@ def __init__(
     team.add_team_history_to_members = add_team_history_to_members
     team.num_team_history_runs = num_team_history_runs
 
-    # Deprecated param mapping
-    if search_session_history is not None and not search_past_sessions:
-        search_past_sessions = search_session_history
-    if num_history_sessions is not None and num_past_sessions_to_search is None:
-        num_past_sessions_to_search = num_history_sessions
-
     team.search_past_sessions = search_past_sessions
     team.num_past_sessions_to_search = num_past_sessions_to_search
     team.num_past_session_runs_in_search = num_past_session_runs_in_search
@@ -327,14 +318,10 @@ def __init__(
     team.parse_response = parse_response
 
     team.db = db
+    team.checkpoint = checkpoint
 
     team.enable_agentic_memory = enable_agentic_memory
-
-    if enable_user_memories is not None:
-        team.update_memory_on_run = enable_user_memories
-    else:
-        team.update_memory_on_run = update_memory_on_run
-    team.enable_user_memories = team.update_memory_on_run  # Soon to be deprecated. Use update_memory_on_run
+    team.update_memory_on_run = update_memory_on_run
 
     team.add_memories_to_context = add_memories_to_context
     team.memory_manager = memory_manager
@@ -631,7 +618,17 @@ def _set_learning_machine(team: "Team") -> None:
             team.learning.db = team.db
         if team.learning.model is None:
             team.learning.model = team.model
+        if (
+            team.learning.learned_knowledge
+            and team.learning.knowledge is None
+            and getattr(team, "knowledge", None) is not None
+        ):
+            team.learning.knowledge = team.knowledge
         team._learning = team.learning
+
+        # PROPOSE/HITL modes need chat history for multi-turn confirmation
+        if team._learning.requires_history and not team.add_history_to_context:
+            team.add_history_to_context = True
 
 
 def _initialize_session(
@@ -695,6 +692,27 @@ def _resolve_models(team: "Team") -> None:
         team.fallback_config.resolve_models()
 
 
+def set_checkpoint(team: "Team") -> None:
+    """Resolve the team's checkpoint setting. Mirrors agent.set_checkpoint.
+
+    Constructor default is None so that OS-level inheritance can fill it. If
+    still None at first run, fall back to "runs" (today's terminal-only
+    behavior).
+
+    "tools" is reserved for 3.0 (see ADR-006) and raises NotImplementedError.
+    """
+    if team.checkpoint is None:
+        team.checkpoint = "runs"
+    elif team.checkpoint == "tools":
+        raise NotImplementedError(
+            'checkpoint="tools" is reserved for the 3.0 runs-table split and not available yet. Use "tool-batch" or "runs".'
+        )
+    elif team.checkpoint not in ("runs", "tool-batch"):
+        raise ValueError(
+            f'Invalid checkpoint level: {team.checkpoint!r}. Expected one of: "runs", "tool-batch", "tools".'
+        )
+
+
 def initialize_team(team: "Team", debug_mode: Optional[bool] = None) -> None:
     # Make sure for the team, we are using the team logger
     use_team_logger()
@@ -704,6 +722,8 @@ def initialize_team(team: "Team", debug_mode: Optional[bool] = None) -> None:
             "`delegate_to_all_members` and `respond_directly` are both enabled. The task will be delegated to all members, but `respond_directly` will be disabled."
         )
         team.respond_directly = False
+
+    set_checkpoint(team)
 
     _set_default_model(team)
 

@@ -1,11 +1,12 @@
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterator, List, Optional, Union
 from uuid import uuid4
 
 from agno.registry import Registry
 from agno.run.agent import RunOutputEvent
 from agno.run.base import RunContext
+from agno.run.cancel import araise_if_cancelled, raise_if_cancelled
 from agno.run.team import TeamRunOutputEvent
 from agno.run.workflow import (
     LoopExecutionCompletedEvent,
@@ -61,7 +62,7 @@ class Loop:
         - 'all_success && current_iteration >= 2'
 
     HITL Mode:
-        Start confirmation (requires_confirmation=True):
+        Start confirmation:
            - Pauses before the first iteration
            - User confirms -> execute loop, User rejects -> skip loop
     """
@@ -78,16 +79,7 @@ class Loop:
     # When False (default), each iteration receives the original step input.
     forward_iteration_output: bool = False
 
-    # HITL configuration - start confirmation
-    # If True, the loop will pause before the first iteration and require user confirmation
-    requires_confirmation: bool = False
-    confirmation_message: Optional[str] = None
-    on_reject: Union[OnReject, str] = OnReject.skip
-
-    # HITL configuration - per-iteration review
-    # If True, the loop will pause after each iteration for human review
-    requires_iteration_review: bool = False
-    iteration_review_message: Optional[str] = None
+    human_review: HumanReview = field(default_factory=HumanReview)
 
     def __init__(
         self,
@@ -97,11 +89,6 @@ class Loop:
         max_iterations: int = 3,
         end_condition: Optional[Union[Callable[[List[StepOutput]], bool], str]] = None,
         forward_iteration_output: bool = False,
-        requires_confirmation: bool = False,
-        confirmation_message: Optional[str] = None,
-        on_reject: Union[OnReject, str] = OnReject.skip,
-        requires_iteration_review: bool = False,
-        iteration_review_message: Optional[str] = None,
         human_review: Optional[HumanReview] = None,
     ):
         self.steps = steps
@@ -111,29 +98,11 @@ class Loop:
         self.end_condition = end_condition
         self.forward_iteration_output = forward_iteration_output
 
-        # Build HITL config - explicit hitl= takes priority over flat params
-        if human_review is not None:
-            self.human_review = human_review
-        else:
-            self.human_review = HumanReview(
-                requires_confirmation=requires_confirmation,
-                confirmation_message=confirmation_message,
-                on_reject=on_reject,
-                requires_iteration_review=requires_iteration_review,
-                iteration_review_message=iteration_review_message,
-            )
+        self.human_review = human_review or HumanReview()
 
-        # Validate HumanReview config for Loop
         from agno.workflow.types import validate_human_review_for_loop
 
         validate_human_review_for_loop(self.human_review)
-
-        # Store HITL fields as attributes for backward compatibility
-        self.requires_confirmation = self.human_review.requires_confirmation
-        self.confirmation_message = self.human_review.confirmation_message
-        self.on_reject = self.human_review.on_reject
-        self.requires_iteration_review = self.human_review.requires_iteration_review
-        self.iteration_review_message = self.human_review.iteration_review_message
 
     def to_dict(self) -> Dict[str, Any]:
         result: Dict[str, Any] = {
@@ -177,8 +146,9 @@ class Loop:
         Returns:
             StepRequirement configured for this loop's HITL needs.
         """
-        message = self.confirmation_message or f"Execute loop '{self.name or 'loop'}'?"
+        message = self.human_review.confirmation_message or f"Execute loop '{self.name or 'loop'}'?"
 
+        on_reject = self.human_review.on_reject
         return StepRequirement(
             step_id=str(uuid4()),
             step_name=self.name or f"loop_{step_index + 1}",
@@ -186,7 +156,7 @@ class Loop:
             step_type="Loop",
             requires_confirmation=True,
             confirmation_message=message,
-            on_reject=self.on_reject.value if isinstance(self.on_reject, OnReject) else str(self.on_reject),
+            on_reject=on_reject.value if isinstance(on_reject, OnReject) else str(on_reject),
             requires_user_input=False,
             step_input=step_input,
         )
@@ -209,10 +179,11 @@ class Loop:
         Returns:
             StepRequirement configured for iteration review.
         """
-        message = self.iteration_review_message or (
+        message = self.human_review.iteration_review_message or (
             f"Loop '{self.name or 'loop'}' completed iteration {iteration + 1}/{self.max_iterations}. Continue?"
         )
 
+        on_reject = self.human_review.on_reject
         return StepRequirement(
             step_id=str(uuid4()),
             step_name=self.name or f"loop_{step_index + 1}",
@@ -222,7 +193,7 @@ class Loop:
             output_review_message=message,
             requires_confirmation=True,
             confirmation_message=message,
-            on_reject=self.on_reject.value if isinstance(self.on_reject, OnReject) else str(self.on_reject),
+            on_reject=on_reject.value if isinstance(on_reject, OnReject) else str(on_reject),
             step_input=step_input,
             step_output=iteration_output,
             is_post_execution=True,
@@ -274,18 +245,13 @@ class Loop:
                 else:
                     raise ValueError(f"Registry required to deserialize end_condition function '{end_condition_data}'")
 
-        # HITL config
         if data.get("human_review"):
             human_review = HumanReview.from_dict(data["human_review"])
         else:
-            # Backward compat: build HITL from flat keys
-            human_review = HumanReview(
-                requires_confirmation=data.get("requires_confirmation", False),
-                confirmation_message=data.get("confirmation_message"),
-                on_reject=data.get("on_reject", "skip"),
-                requires_iteration_review=data.get("requires_iteration_review", False),
-                iteration_review_message=data.get("iteration_review_message"),
-            )
+            from agno.workflow.utils.hitl import drop_legacy_hitl_keys
+
+            drop_legacy_hitl_keys(data, StepType.LOOP)
+            human_review = HumanReview()
 
         return cls(
             name=data.get("name"),
@@ -460,6 +426,8 @@ class Loop:
         early_termination = False
 
         while iteration < self.max_iterations:
+            if workflow_run_response and workflow_run_response.run_id:
+                raise_if_cancelled(workflow_run_response.run_id)
             # Execute all steps in this iteration - mirroring workflow logic
             iteration_results: List[StepOutput] = []
             current_step_input = step_input
@@ -539,7 +507,7 @@ class Loop:
                 break
 
             # Per-iteration review: pause for human review before continuing
-            if self.requires_iteration_review and iteration < self.max_iterations:
+            if self.human_review.requires_iteration_review and iteration < self.max_iterations:
                 # Build the last iteration output for review
                 last_iter_output = iteration_results[-1] if iteration_results else None
                 if last_iter_output:
@@ -625,6 +593,8 @@ class Loop:
         early_termination = False
 
         while iteration < self.max_iterations:
+            if workflow_run_response and workflow_run_response.run_id:
+                raise_if_cancelled(workflow_run_response.run_id)
             log_debug(f"Loop iteration {iteration + 1}/{self.max_iterations}")
 
             if stream_events and workflow_run_response:
@@ -763,7 +733,7 @@ class Loop:
                 break
 
             # Per-iteration review: pause for human review before continuing
-            if self.requires_iteration_review and iteration < self.max_iterations:
+            if self.human_review.requires_iteration_review and iteration < self.max_iterations:
                 last_iter_output = iteration_results[-1] if iteration_results else None
                 if last_iter_output:
                     flattened_so_far = []
@@ -850,6 +820,8 @@ class Loop:
         early_termination = False
 
         while iteration < self.max_iterations:
+            if workflow_run_response and workflow_run_response.run_id:
+                await araise_if_cancelled(workflow_run_response.run_id)
             # Execute all steps in this iteration - mirroring workflow logic
             iteration_results: List[StepOutput] = []
             current_step_input = step_input
@@ -929,7 +901,7 @@ class Loop:
                 break
 
             # Per-iteration review: pause for human review before continuing (async)
-            if self.requires_iteration_review and iteration < self.max_iterations:
+            if self.human_review.requires_iteration_review and iteration < self.max_iterations:
                 last_iter_output = iteration_results[-1] if iteration_results else None
                 if last_iter_output:
                     flattened_so_far = []
@@ -1014,6 +986,8 @@ class Loop:
         early_termination = False
 
         while iteration < self.max_iterations:
+            if workflow_run_response and workflow_run_response.run_id:
+                await araise_if_cancelled(workflow_run_response.run_id)
             log_debug(f"Async loop iteration {iteration + 1}/{self.max_iterations}")
 
             if stream_events and workflow_run_response:
@@ -1152,7 +1126,7 @@ class Loop:
                 break
 
             # Per-iteration review: pause for human review before continuing
-            if self.requires_iteration_review and iteration < self.max_iterations:
+            if self.human_review.requires_iteration_review and iteration < self.max_iterations:
                 last_iter_output = iteration_results[-1] if iteration_results else None
                 if last_iter_output:
                     flattened_so_far = []

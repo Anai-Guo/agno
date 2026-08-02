@@ -1,7 +1,7 @@
 import json
 import time
 from datetime import date, datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union, cast
 from uuid import uuid4
 
 if TYPE_CHECKING:
@@ -786,8 +786,11 @@ class FirestoreDb(BaseDb):
             log_error(f"Error deleting memories: {str(e)}")
             raise e
 
-    def get_all_memory_topics(self, create_collection_if_not_found: Optional[bool] = True) -> List[str]:
+    def get_all_memory_topics(self, user_id: Optional[str] = None) -> List[str]:
         """Get all memory topics from the database.
+
+        Args:
+            user_id (Optional[str]): The ID of the user to filter by.
 
         Returns:
             List[str]: The topics.
@@ -800,13 +803,18 @@ class FirestoreDb(BaseDb):
             if collection_ref is None:
                 return []
 
-            docs = collection_ref.stream()
+            query = (
+                collection_ref
+                if user_id is None
+                else collection_ref.where(filter=FieldFilter("user_id", "==", user_id))
+            )
+            docs = query.stream()
 
-            all_topics = set()
+            all_topics: set[str] = set()
             for doc in docs:
                 data = doc.to_dict()
                 topics = data.get("topics", [])
-                if topics:
+                if topics and isinstance(topics, list):
                     all_topics.update(topics)
 
             return [topic for topic in all_topics if topic]
@@ -1658,11 +1666,12 @@ class FirestoreDb(BaseDb):
             log_error(f"Error deleting eval run {eval_run_id}: {str(e)}")
             raise e
 
-    def delete_eval_runs(self, eval_run_ids: List[str]) -> None:
+    def delete_eval_runs(self, eval_run_ids: List[str], user_id: Optional[str] = None) -> None:
         """Delete multiple eval runs from the database.
 
         Args:
             eval_run_ids (List[str]): The IDs of the eval runs to delete.
+            user_id (Optional[str]): If set, only delete runs owned by this user.
 
         Raises:
             Exception: If there is an error deleting the eval runs.
@@ -1675,6 +1684,8 @@ class FirestoreDb(BaseDb):
             for eval_run_id in eval_run_ids:
                 docs = collection_ref.where(filter=FieldFilter("run_id", "==", eval_run_id)).stream()
                 for doc in docs:
+                    if user_id is not None and doc.to_dict().get("user_id") != user_id:
+                        continue
                     batch.delete(doc.reference)
                     deleted_count += 1
 
@@ -1690,13 +1701,14 @@ class FirestoreDb(BaseDb):
             raise e
 
     def get_eval_run(
-        self, eval_run_id: str, deserialize: Optional[bool] = True
+        self, eval_run_id: str, deserialize: Optional[bool] = True, user_id: Optional[str] = None
     ) -> Optional[Union[EvalRunRecord, Dict[str, Any]]]:
         """Get an eval run from the database.
 
         Args:
             eval_run_id (str): The ID of the eval run to get.
             deserialize (Optional[bool]): Whether to serialize the eval run. Defaults to True.
+            user_id (Optional[str]): If set, only return the run if owned by this user.
 
         Returns:
             Optional[Union[EvalRunRecord, Dict[str, Any]]]:
@@ -1721,6 +1733,9 @@ class FirestoreDb(BaseDb):
             if not eval_run_raw:
                 return None
 
+            if user_id is not None and eval_run_raw.get("user_id") != user_id:
+                return None
+
             if not deserialize:
                 return eval_run_raw
 
@@ -1743,6 +1758,7 @@ class FirestoreDb(BaseDb):
         filter_type: Optional[EvalFilterType] = None,
         eval_type: Optional[List[EvalType]] = None,
         deserialize: Optional[bool] = True,
+        user_id: Optional[str] = None,
     ) -> Union[List[EvalRunRecord], Tuple[List[Dict[str, Any]], int]]:
         """Get all eval runs from the database.
 
@@ -1755,6 +1771,7 @@ class FirestoreDb(BaseDb):
             team_id (Optional[str]): The ID of the team to filter by.
             workflow_id (Optional[str]): The ID of the workflow to filter by.
             model_id (Optional[str]): The ID of the model to filter by.
+            user_id (Optional[str]): If set, only return runs owned by this user.
             eval_type (Optional[List[EvalType]]): The type of eval to filter by.
             filter_type (Optional[EvalFilterType]): The type of filter to apply.
             deserialize (Optional[bool]): Whether to serialize the eval runs. Defaults to True.
@@ -1783,16 +1800,11 @@ class FirestoreDb(BaseDb):
                 query = query.where(filter=FieldFilter("workflow_id", "==", workflow_id))
             if model_id is not None:
                 query = query.where(filter=FieldFilter("model_id", "==", model_id))
+            if user_id is not None:
+                query = query.where(filter=FieldFilter("user_id", "==", user_id))
             if eval_type is not None and len(eval_type) > 0:
                 eval_values = [et.value for et in eval_type]
                 query = query.where(filter=FieldFilter("eval_type", "in", eval_values))
-            if filter_type is not None:
-                if filter_type == EvalFilterType.AGENT:
-                    query = query.where(filter=FieldFilter("agent_id", "!=", None))
-                elif filter_type == EvalFilterType.TEAM:
-                    query = query.where(filter=FieldFilter("team_id", "!=", None))
-                elif filter_type == EvalFilterType.WORKFLOW:
-                    query = query.where(filter=FieldFilter("workflow_id", "!=", None))
 
             # Apply default sorting by created_at desc if no sort parameters provided
             if sort_by is None:
@@ -1805,6 +1817,17 @@ class FirestoreDb(BaseDb):
             # Get all documents for counting before pagination
             all_docs = query.stream()
             all_records = [doc.to_dict() for doc in all_docs]
+
+            # Filter by component type in Python. Firestore would require the
+            # inequality field to also be the first sort field, breaking the
+            # created_at ordering.
+            if filter_type is not None:
+                if filter_type == EvalFilterType.AGENT:
+                    all_records = [record for record in all_records if record.get("agent_id") is not None]
+                elif filter_type == EvalFilterType.TEAM:
+                    all_records = [record for record in all_records if record.get("team_id") is not None]
+                elif filter_type == EvalFilterType.WORKFLOW:
+                    all_records = [record for record in all_records if record.get("workflow_id") is not None]
 
             if not all_records:
                 return [] if deserialize else ([], 0)
@@ -1832,7 +1855,7 @@ class FirestoreDb(BaseDb):
             raise e
 
     def rename_eval_run(
-        self, eval_run_id: str, name: str, deserialize: Optional[bool] = True
+        self, eval_run_id: str, name: str, deserialize: Optional[bool] = True, user_id: Optional[str] = None
     ) -> Optional[Union[EvalRunRecord, Dict[str, Any]]]:
         """Update the name of an eval run in the database.
 
@@ -1840,6 +1863,7 @@ class FirestoreDb(BaseDb):
             eval_run_id (str): The ID of the eval run to update.
             name (str): The new name of the eval run.
             deserialize (Optional[bool]): Whether to serialize the eval run. Defaults to True.
+            user_id (Optional[str]): If set, only rename the run if owned by this user.
 
         Returns:
             Optional[Union[EvalRunRecord, Dict[str, Any]]]:
@@ -1855,11 +1879,14 @@ class FirestoreDb(BaseDb):
                 return None
 
             docs = collection_ref.where(filter=FieldFilter("run_id", "==", eval_run_id)).stream()
-            doc_ref = next((doc.reference for doc in docs), None)
+            doc = next(iter(docs), None)
 
-            if doc_ref is None:
+            if doc is None:
+                return None
+            if user_id is not None and doc.to_dict().get("user_id") != user_id:
                 return None
 
+            doc_ref = doc.reference
             doc_ref.update({"name": name, "updated_at": int(time.time())})
 
             updated_doc = doc_ref.get()
@@ -1877,6 +1904,29 @@ class FirestoreDb(BaseDb):
 
         except Exception as e:
             log_error(f"Error updating eval run name {eval_run_id}: {str(e)}")
+            raise e
+
+    def update_eval_run_user_id(self, eval_run_id: str, user_id: str) -> None:
+        """Set the owner (user_id) on an existing eval run.
+
+        Args:
+            eval_run_id (str): The ID of the eval run to update.
+            user_id (str): The owner to set.
+        """
+        try:
+            collection_ref = self._get_collection(table_type="evals")
+            if not collection_ref:
+                return
+
+            docs = collection_ref.where(filter=FieldFilter("run_id", "==", eval_run_id)).stream()
+            doc_ref = next((doc.reference for doc in docs), None)
+            if doc_ref is None:
+                return
+
+            doc_ref.update({"user_id": user_id})
+
+        except Exception as e:
+            log_error(f"Error setting owner on eval run {eval_run_id}: {str(e)}")
             raise e
 
     # --- Traces ---
@@ -1942,18 +1992,21 @@ class FirestoreDb(BaseDb):
                 if should_update_name:
                     update_values["name"] = trace.name
 
-                # Update context fields only if new value is not None
-                if trace.run_id is not None:
+                # Preserve existing non-null context values: only fill in fields
+                # that the existing row left blank. Otherwise a later upsert from
+                # a child span (e.g. a post-hook agent's run with a different
+                # session_id) would overwrite the trace's already-correct context.
+                if existing_data.get("run_id") is None and trace.run_id is not None:
                     update_values["run_id"] = trace.run_id
-                if trace.session_id is not None:
+                if existing_data.get("session_id") is None and trace.session_id is not None:
                     update_values["session_id"] = trace.session_id
-                if trace.user_id is not None:
+                if existing_data.get("user_id") is None and trace.user_id is not None:
                     update_values["user_id"] = trace.user_id
-                if trace.agent_id is not None:
+                if existing_data.get("agent_id") is None and trace.agent_id is not None:
                     update_values["agent_id"] = trace.agent_id
-                if trace.team_id is not None:
+                if existing_data.get("team_id") is None and trace.team_id is not None:
                     update_values["team_id"] = trace.team_id
-                if trace.workflow_id is not None:
+                if existing_data.get("workflow_id") is None and trace.workflow_id is not None:
                     update_values["workflow_id"] = trace.workflow_id
 
                 existing_doc.reference.update(update_values)
@@ -2123,6 +2176,7 @@ class FirestoreDb(BaseDb):
         end_time: Optional[datetime] = None,
         limit: Optional[int] = 20,
         page: Optional[int] = 1,
+        group_by: Literal["session", "agent", "team", "workflow", "endpoint"] = "session",
     ) -> tuple[List[Dict[str, Any]], int]:
         """Get trace statistics grouped by session.
 
@@ -2135,12 +2189,19 @@ class FirestoreDb(BaseDb):
             end_time: Filter sessions with traces created before this datetime.
             limit: Maximum number of sessions to return per page.
             page: Page number (1-indexed).
+            group_by: Only the default "session" grouping is supported by this backend.
 
         Returns:
             tuple[List[Dict], int]: Tuple of (list of session stats dicts, total count).
                 Each dict contains: session_id, user_id, agent_id, team_id, workflow_id, total_traces,
                 first_trace_at, last_trace_at.
         """
+        if group_by != "session":
+            raise NotImplementedError(
+                f"get_trace_stats with group_by={group_by!r} is not supported by {self.__class__.__name__}. "
+                "Only the default 'session' grouping is available."
+            )
+
         try:
             collection_ref = self._get_collection(table_type="traces")
             if collection_ref is None:
