@@ -87,7 +87,14 @@ class TestTelegramToolsInit:
         from agno.tools.telegram import TelegramTools
 
         tools = TelegramTools(chat_id="12345")
-        for name in ("send_photo", "telegram_send_document", "send_video", "send_audio", "send_animation", "send_sticker"):
+        for name in (
+            "send_photo",
+            "telegram_send_document",
+            "send_video",
+            "send_audio",
+            "send_animation",
+            "send_sticker",
+        ):
             assert name not in tools.functions
 
     def test_media_tools_enabled_explicitly(self, monkeypatch):
@@ -103,7 +110,14 @@ class TestTelegramToolsInit:
             enable_send_animation=True,
             enable_send_sticker=True,
         )
-        for name in ("send_photo", "telegram_send_document", "send_video", "send_audio", "send_animation", "send_sticker"):
+        for name in (
+            "send_photo",
+            "telegram_send_document",
+            "send_video",
+            "send_audio",
+            "send_animation",
+            "send_sticker",
+        ):
             assert name in tools.functions
 
     def test_edit_delete_disabled_by_default(self, monkeypatch):
@@ -231,7 +245,9 @@ class TestSendMessage:
         from agno.tools.telegram import TelegramTools
 
         tools = TelegramTools(chat_id="12345")
-        tools.bot.telegram_send_message = MagicMock(side_effect=_FakeApiTelegramException("sendMessage", "Bad Request", 400))
+        tools.bot.telegram_send_message = MagicMock(
+            side_effect=_FakeApiTelegramException("sendMessage", "Bad Request", 400)
+        )
 
         result = tools.telegram_send_message("Hello")
         parsed = json.loads(result)
@@ -439,7 +455,9 @@ class TestDeleteMessage:
         from agno.tools.telegram import TelegramTools
 
         tools = TelegramTools(chat_id="12345", enable_delete_message=True)
-        tools.bot.telegram_delete_message = MagicMock(side_effect=_FakeApiTelegramException("deleteMessage", "Bad Request", 400))
+        tools.bot.telegram_delete_message = MagicMock(
+            side_effect=_FakeApiTelegramException("deleteMessage", "Bad Request", 400)
+        )
 
         result = tools.telegram_delete_message(message_id=42)
         parsed = json.loads(result)

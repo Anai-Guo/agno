@@ -103,7 +103,7 @@ class SlackTools(Toolkit):
             )
 
         # Mention formatting — required for real @mentions in Slack
-        if "send_message" in enabled or "send_message_thread" in enabled:
+        if "slack_send_message" in enabled or "send_message_thread" in enabled:
             sections.append(
                 "**@mentions in Slack messages:**\n"
                 "- To mention a user, use the format `<@USER_ID>` (e.g., `<@U0AQXMJ3FUP>`).\n"

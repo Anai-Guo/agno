@@ -344,7 +344,9 @@ def test_init_read_scope_mismatch(mock_creds):
         patch("googleapiclient.discovery.build"),
         pytest.raises(ValueError, match="read scope"),
     ):
-        GoogleDriveTools(creds=mock_creds, scopes=["https://www.googleapis.com/auth/gmail.readonly"], gdrive_read_file=True)
+        GoogleDriveTools(
+            creds=mock_creds, scopes=["https://www.googleapis.com/auth/gmail.readonly"], gdrive_read_file=True
+        )
 
 
 def test_init_write_scope_mismatch(mock_creds):

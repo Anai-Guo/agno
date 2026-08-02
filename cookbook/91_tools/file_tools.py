@@ -213,7 +213,7 @@ agent_sees_everything = Agent(
     markdown=True,
 )
 
-# Example 9: Directory-scoped listing. list_files accepts an optional `directory`
+# Example 9: Directory-scoped listing. file_list accepts an optional `directory`
 # argument, exposed in the tool schema, so the agent can list a specific
 # subdirectory instead of the whole base_dir.
 agent_directory_scoped = Agent(
@@ -226,7 +226,7 @@ agent_directory_scoped = Agent(
     ],
     description="You explore project subdirectories on request.",
     instructions=[
-        "Use list_files with the directory argument to list a specific subdirectory",
+        "Use file_list with the directory argument to list a specific subdirectory",
         "List only what the user asks for, not the whole tree",
     ],
     markdown=True,
